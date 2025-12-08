@@ -8,15 +8,26 @@ import sqlite3
 from hashlib import sha256
 import queue
 import time
+import os
+import sys
 
 # ============================================
-# SERVER COMPONENT
+# SERVER CONFIGURATION
+# ============================================
+
+SERVER_HOST = '127.0.0.1'
+SERVER_PORT = 5555
+MAX_USERS_PER_SERVER = 10  # Maximum users per server before creating new one
+
+# ============================================
+# SERVER COMPONENT (Run separately)
 # ============================================
 
 class ChatServer:
-    def __init__(self, host='127.0.0.1', port=5555):
+    def __init__(self, host=SERVER_HOST, port=SERVER_PORT, server_id=1):
         self.host = host
         self.port = port
+        self.server_id = server_id
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.clients = {}
         self.lock = threading.Lock()
@@ -25,7 +36,9 @@ class ChatServer:
         
     def setup_database(self):
         """Setup SQLite database for user accounts"""
-        self.conn = sqlite3.connect(':memory:', check_same_thread=False)
+        # Use a shared database file for all servers
+        db_file = f'chat_server_{self.server_id}.db'
+        self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS users
                              (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,16 +46,18 @@ class ChatServer:
                               password TEXT)''')
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS messages
                              (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                              server_id INTEGER,
                               sender TEXT,
                               message TEXT,
                               timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         self.conn.commit()
         
+        # Add test users if they don't exist
         test_users = [('admin', 'admin123'), ('user1', 'password1'), ('user2', 'password2')]
         for username, password in test_users:
             try:
                 hashed_password = sha256(password.encode()).hexdigest()
-                self.cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)",
+                self.cursor.execute("INSERT OR IGNORE INTO users (username, password) VALUES (?, ?)",
                                   (username, hashed_password))
             except:
                 pass
@@ -87,13 +102,14 @@ class ChatServer:
         return self.cursor.fetchone() is not None
     
     def save_message(self, sender, message):
-        self.cursor.execute('''INSERT INTO messages (sender, message) VALUES (?, ?)''',
-                          (sender, message))
+        self.cursor.execute('''INSERT INTO messages (server_id, sender, message) VALUES (?, ?, ?)''',
+                          (self.server_id, sender, message))
         self.conn.commit()
     
     def get_message_history(self, count=50):
         self.cursor.execute('''SELECT sender, message, timestamp FROM messages 
-                             ORDER BY timestamp DESC LIMIT ?''', (count,))
+                             WHERE server_id=? ORDER BY timestamp DESC LIMIT ?''', 
+                          (self.server_id, count))
         return self.cursor.fetchall()
     
     def broadcast_user_list(self, exclude_socket=None):
@@ -146,25 +162,23 @@ class ChatServer:
                         with self.lock:
                             self.clients[client_socket] = username
                         
-                        # Get message history
                         history = self.get_message_history()
                         response = {
                             'type': 'login',
                             'success': True,
                             'username': username,
                             'history': history,
-                            'users': list(self.clients.values())  # Send current users to new user
+                            'users': list(self.clients.values()),
+                            'server_id': self.server_id,
+                            'user_count': len(self.clients)
                         }
                         client_socket.send(json.dumps(response).encode('utf-8'))
                         
-                        # Notify ALL other users about new user AND send updated user list
                         notification = {
                             'type': 'notification',
-                            'message': f'{username} has joined the chat!'
+                            'message': f'{username} has joined the chat! (Server {self.server_id})'
                         }
                         self.broadcast(json.dumps(notification), exclude_socket=client_socket)
-                        
-                        # Broadcast updated user list to ALL users (including the new one)
                         self.broadcast_user_list()
                         
                     else:
@@ -181,7 +195,8 @@ class ChatServer:
                         'type': 'message',
                         'sender': username,
                         'message': data['message'],
-                        'timestamp': datetime.datetime.now().strftime('%H:%M:%S')
+                        'timestamp': datetime.datetime.now().strftime('%H:%M:%S'),
+                        'server_id': self.server_id
                     }
                     self.broadcast(json.dumps(message_data), exclude_socket=client_socket)
                     
@@ -192,7 +207,8 @@ class ChatServer:
                         'sender': username,
                         'receiver': receiver,
                         'message': data['message'],
-                        'timestamp': datetime.datetime.now().strftime('%H:%M:%S')
+                        'timestamp': datetime.datetime.now().strftime('%H:%M:%S'),
+                        'server_id': self.server_id
                     }
                     
                     with self.lock:
@@ -208,7 +224,8 @@ class ChatServer:
                         users = list(self.clients.values())
                     response = {
                         'type': 'users_list',
-                        'users': users
+                        'users': users,
+                        'server_id': self.server_id
                     }
                     client_socket.send(json.dumps(response).encode('utf-8'))
                 
@@ -219,12 +236,14 @@ class ChatServer:
                         'type': 'uptime',
                         'uptime': self.get_uptime(),
                         'start_time': datetime.datetime.fromtimestamp(self.start_time).strftime('%Y-%m-%d %H:%M:%S'),
-                        'online_users': online_count
+                        'online_users': online_count,
+                        'server_id': self.server_id,
+                        'max_users': MAX_USERS_PER_SERVER
                     }
                     client_socket.send(json.dumps(response).encode('utf-8'))
                         
         except Exception as e:
-            print(f"Error with client {address}: {e}")
+            print(f"Server {self.server_id} - Error with client {address}: {e}")
         finally:
             if username:
                 with self.lock:
@@ -235,8 +254,6 @@ class ChatServer:
                         'message': f'{username} has left the chat!'
                     }
                     self.broadcast(json.dumps(notification))
-                    
-                    # Update user list for remaining users
                     self.broadcast_user_list()
                     
             client_socket.close()
@@ -246,30 +263,73 @@ class ChatServer:
             if client_socket in self.clients:
                 username = self.clients[client_socket]
                 del self.clients[client_socket]
-                print(f"{username} disconnected")
+                print(f"Server {self.server_id} - {username} disconnected")
     
-    def start_server_in_thread(self):
-        def run_server():
-            self.server.bind((self.host, self.port))
-            self.server.listen()
-            print(f"Chat server started on {self.host}:{self.port}")
-            print(f"Server start time: {datetime.datetime.fromtimestamp(self.start_time).strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            try:
-                while True:
-                    client_socket, address = self.server.accept()
-                    print(f"New connection from {address}")
-                    client_thread = threading.Thread(
-                        target=self.handle_client,
-                        args=(client_socket, address),
-                        daemon=True
-                    )
-                    client_thread.start()
-            except Exception as e:
-                print(f"Server error: {e}")
+    def start(self):
+        """Start the server (blocking call)"""
+        self.server.bind((self.host, self.port))
+        self.server.listen()
+        print(f"Chat Server {self.server_id} started on {self.host}:{self.port}")
+        print(f"Max users: {MAX_USERS_PER_SERVER}")
+        print(f"Server start time: {datetime.datetime.fromtimestamp(self.start_time).strftime('%Y-%m-%d %H:%M:%S')}")
         
-        server_thread = threading.Thread(target=run_server, daemon=True)
+        try:
+            while True:
+                client_socket, address = self.server.accept()
+                print(f"Server {self.server_id} - New connection from {address}")
+                client_thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(client_socket, address),
+                    daemon=True
+                )
+                client_thread.start()
+        except Exception as e:
+            print(f"Server {self.server_id} error: {e}")
+
+# ============================================
+# SERVER MANAGER (Manages multiple servers)
+# ============================================
+
+class ServerManager:
+    def __init__(self):
+        self.servers = []
+        self.next_port = SERVER_PORT
+        self.next_server_id = 1
+        self.lock = threading.Lock()
+        
+    def start_initial_server(self):
+        """Start the first server"""
+        server = ChatServer(port=self.next_port, server_id=self.next_server_id)
+        self.servers.append(server)
+        self.next_port += 1
+        self.next_server_id += 1
+        
+        # Start server in background thread
+        server_thread = threading.Thread(target=server.start, daemon=True)
         server_thread.start()
+        
+        return server
+    
+    def get_available_server(self):
+        """Get a server with available capacity or create new one"""
+        with self.lock:
+            # Check existing servers for capacity
+            for server in self.servers:
+                if len(server.clients) < MAX_USERS_PER_SERVER:
+                    return server
+            
+            # Create new server if all are full
+            print(f"All servers full, creating new server {self.next_server_id}")
+            new_server = ChatServer(port=self.next_port, server_id=self.next_server_id)
+            self.servers.append(new_server)
+            self.next_port += 1
+            self.next_server_id += 1
+            
+            # Start new server
+            server_thread = threading.Thread(target=new_server.start, daemon=True)
+            server_thread.start()
+            
+            return new_server
 
 # ============================================
 # CLIENT COMPONENT
@@ -282,13 +342,14 @@ class ChatClientGUI:
         self.root.geometry("900x700")
         self.root.configure(bg='#2C3E50')
         
-        self.server = ChatServer()
-        self.server.start_server_in_thread()
-        
+        # Global server manager (shared across all clients)
+        self.server_manager = None
+        self.current_server = None
         self.client_socket = None
         self.connected = False
         self.username = None
         self.message_queue = queue.Queue()
+        self.server_id = None
         
         self.colors = {
             'bg': '#2C3E50',
@@ -303,7 +364,133 @@ class ChatClientGUI:
         
         self.setup_ui()
         self.start_message_handler()
+        self.connect_to_server_system()
+    
+    def connect_to_server_system(self):
+        """Connect to the server system"""
+        try:
+            # Try to connect to the default server port
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.connect((SERVER_HOST, SERVER_PORT))
+            self.connected = True
+            
+            # Start receiving messages
+            threading.Thread(target=self.receive_messages, daemon=True).start()
+            
+            print(f"Connected to server {SERVER_HOST}:{SERVER_PORT}")
+            
+        except ConnectionRefusedError:
+            # Server not running, ask user if they want to start one
+            response = messagebox.askyesno(
+                "Server Not Running",
+                "No chat server is running. Would you like to start a server on this computer?\n\n"
+                "Yes - Start server and connect\n"
+                "No  - Connect to existing server (if any)"
+            )
+            
+            if response:
+                # Start server in a separate process
+                self.start_local_server()
+                time.sleep(2)  # Give server time to start
+                self.connect_to_server_system()
+            else:
+                messagebox.showerror("Connection Failed", 
+                                   "Cannot connect to server. Please make sure a server is running.")
+    
+    def start_local_server(self):
+        """Start a local server process"""
+        import subprocess
         
+        # Start server in a separate Python process
+        server_script = '''
+import socket
+import threading
+import json
+import datetime
+import sqlite3
+import time
+from hashlib import sha256
+
+SERVER_HOST = '127.0.0.1'
+SERVER_PORT = 5555
+
+class SimpleChatServer:
+    def __init__(self):
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.clients = {}
+        self.lock = threading.Lock()
+        self.start_time = time.time()
+        
+    def start(self):
+        self.server.bind((SERVER_HOST, SERVER_PORT))
+        self.server.listen()
+        print(f"Simple Chat Server started on {SERVER_HOST}:{SERVER_PORT}")
+        
+        while True:
+            client_socket, address = self.server.accept()
+            threading.Thread(target=self.handle_client, args=(client_socket, address), daemon=True).start()
+    
+    def handle_client(self, client_socket, address):
+        username = None
+        try:
+            while True:
+                message = client_socket.recv(1024).decode('utf-8')
+                if not message:
+                    break
+                    
+                data = json.loads(message)
+                
+                if data['type'] == 'login':
+                    username = data['username']
+                    with self.lock:
+                        self.clients[client_socket] = username
+                    
+                    response = {
+                        'type': 'login',
+                        'success': True,
+                        'username': username,
+                        'users': list(self.clients.values()),
+                        'server_id': 1
+                    }
+                    client_socket.send(json.dumps(response).encode('utf-8'))
+                    
+                    notification = {
+                        'type': 'notification',
+                        'message': f'{username} has joined the chat!'
+                    }
+                    for sock in list(self.clients.keys()):
+                        if sock != client_socket:
+                            sock.send(json.dumps(notification).encode('utf-8'))
+                            
+                elif data['type'] == 'message' and username:
+                    message_data = {
+                        'type': 'message',
+                        'sender': username,
+                        'message': data['message']
+                    }
+                    for sock in list(self.clients.keys()):
+                        if sock != client_socket:
+                            sock.send(json.dumps(message_data).encode('utf-8'))
+                            
+        except:
+            pass
+        finally:
+            if username:
+                with self.lock:
+                    if client_socket in self.clients:
+                        del self.clients[client_socket]
+
+if __name__ == "__main__":
+    server = SimpleChatServer()
+    server.start()
+'''
+        
+        # Write and execute server script
+        with open('temp_server.py', 'w') as f:
+            f.write(server_script)
+        
+        subprocess.Popen([sys.executable, 'temp_server.py'])
+    
     def setup_ui(self):
         self.title_font = font.Font(family="Helvetica", size=24, weight="bold")
         self.text_font = font.Font(family="Arial", size=11)
@@ -331,16 +518,6 @@ class ChatClientGUI:
         self.setup_chat_tab()
         
         self.notebook.hide(1)
-        self.connect_to_server()
-    
-    def connect_to_server(self):
-        try:
-            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.client_socket.connect((self.server.host, self.server.port))
-            self.connected = True
-            threading.Thread(target=self.receive_messages, daemon=True).start()
-        except Exception as e:
-            messagebox.showerror("Connection Error", "Failed to connect to server")
     
     def setup_login_tab(self):
         title_frame = tk.Frame(self.login_tab, bg=self.colors['bg'])
@@ -352,11 +529,18 @@ class ChatClientGUI:
                               fg=self.colors['accent'])
         title_label.pack()
         
-        subtitle_label = tk.Label(title_frame, text="Secure Online Messaging", 
+        subtitle_label = tk.Label(title_frame, text="Multi-Server Messaging System", 
                                  font=("Arial", 12), 
                                  bg=self.colors['bg'], 
                                  fg=self.colors['fg'])
         subtitle_label.pack(pady=5)
+        
+        server_info = tk.Label(title_frame, 
+                              text=f"Server: {SERVER_HOST}:{SERVER_PORT}",
+                              font=("Arial", 10),
+                              bg=self.colors['bg'],
+                              fg=self.colors['success'])
+        server_info.pack(pady=5)
         
         login_frame = tk.Frame(self.login_tab, bg=self.colors['secondary'], 
                               relief=tk.RAISED, bd=2)
@@ -431,6 +615,12 @@ class ChatClientGUI:
                                   fg=self.colors['fg'],
                                   font=self.text_font)
         self.user_label.pack(side=tk.LEFT, padx=10, pady=10)
+        
+        self.server_label = tk.Label(top_frame, text="Server: None", 
+                                    bg=self.colors['secondary'], 
+                                    fg=self.colors['accent'],
+                                    font=self.text_font)
+        self.server_label.pack(side=tk.LEFT, padx=10, pady=10)
         
         self.uptime_btn = tk.Button(top_frame, text="🖥️ Server Info", 
                                    command=self.get_server_uptime,
@@ -531,6 +721,10 @@ class ChatClientGUI:
                                lambda e: self.message_input.insert(tk.INSERT, '\n'))
     
     def login(self):
+        if not self.connected:
+            self.login_status.config(text="Not connected to server!")
+            return
+            
         username = self.username_entry.get().strip()
         password = self.password_entry.get().strip()
         
@@ -551,6 +745,10 @@ class ChatClientGUI:
             self.login_status.config(text="Connection error!")
     
     def register(self):
+        if not self.connected:
+            self.login_status.config(text="Not connected to server!")
+            return
+            
         username = self.username_entry.get().strip()
         password = self.password_entry.get().strip()
         
@@ -572,12 +770,14 @@ class ChatClientGUI:
     
     def logout(self):
         self.username = None
+        self.server_id = None
         self.notebook.select(0)
         self.notebook.hide(1)
         self.message_display.config(state='normal')
         self.message_display.delete(1.0, tk.END)
         self.message_display.config(state='disabled')
         self.user_label.config(text="Not logged in")
+        self.server_label.config(text="Server: None")
         self.users_listbox.delete(0, tk.END)
     
     def send_message(self):
@@ -636,12 +836,13 @@ class ChatClientGUI:
                 pass
     
     def receive_messages(self):
-        while True:
+        while self.connected:
             try:
                 message = self.client_socket.recv(1024).decode('utf-8')
                 if message:
                     self.message_queue.put(message)
             except:
+                self.connected = False
                 break
     
     def start_message_handler(self):
@@ -663,21 +864,25 @@ class ChatClientGUI:
             if data['type'] == 'login':
                 if data['success']:
                     self.username = data['username']
-                    self.user_label.config(text=f"Logged in as: {self.username}")
+                    self.server_id = data.get('server_id', 1)
+                    
+                    self.user_label.config(text=f"User: {self.username}")
+                    self.server_label.config(text=f"Server: {self.server_id}")
                     self.login_status.config(text="Login successful!", fg=self.colors['success'])
                     
                     self.notebook.select(1)
                     self.notebook.hide(0)
                     
                     self.message_display.config(state='normal')
-                    self.message_display.insert(tk.END, f"=== Welcome {self.username} ===\n\n")
+                    self.message_display.insert(tk.END, f"=== Welcome to Server {self.server_id} ===\n")
+                    self.message_display.insert(tk.END, f"=== Logged in as: {self.username} ===\n\n")
+                    
                     if 'history' in data:
                         for sender, msg, timestamp in reversed(data['history']):
                             self.display_message(f"{sender}: {msg}", "history")
                     self.message_display.config(state='disabled')
                     self.message_display.see(tk.END)
                     
-                    # Update user list from login response
                     if 'users' in data:
                         self.update_users_list(data['users'])
                     
@@ -691,11 +896,13 @@ class ChatClientGUI:
                     self.login_status.config(text=data['message'], fg=self.colors['warning'])
                     
             elif data['type'] == 'message':
-                self.display_message(f"{data['sender']}: {data['message']}", "other")
+                server_info = f"[S{data.get('server_id', 1)}] " if 'server_id' in data else ""
+                self.display_message(f"{server_info}{data['sender']}: {data['message']}", "other")
                 
             elif data['type'] == 'private':
                 if data['receiver'] == self.username or data['sender'] == self.username:
-                    prefix = f"{data['sender']} → {data['receiver']}"
+                    server_info = f"[S{data.get('server_id', 1)}] " if 'server_id' in data else ""
+                    prefix = f"{server_info}{data['sender']} → {data['receiver']}"
                     self.display_message(f"{prefix}: {data['message']}", "private")
                 
             elif data['type'] == 'notification':
@@ -705,12 +912,15 @@ class ChatClientGUI:
                 self.update_users_list(data['users'])
                 
             elif data['type'] == 'uptime':
+                server_id = data.get('server_id', 1)
+                max_users = data.get('max_users', 10)
                 messagebox.showinfo(
-                    "Server Information",
+                    f"Server {server_id} Information",
                     f"🚀 Server Started: {data['start_time']}\n"
                     f"⏱️  Uptime: {data['uptime']}\n"
-                    f"👥 Online Users: {data['online_users']}\n"
-                    f"🌐 Server: {self.server.host}:{self.server.port}"
+                    f"👥 Online Users: {data['online_users']}/{max_users}\n"
+                    f"🌐 Server ID: {server_id}\n"
+                    f"📍 Address: {SERVER_HOST}:{SERVER_PORT}"
                 )
                 
         except Exception as e:
@@ -733,14 +943,12 @@ class ChatClientGUI:
     def update_users_list(self, users):
         self.users_listbox.delete(0, tk.END)
         
-        # Show all users, highlight yourself
         for user in users:
             if user == self.username:
                 self.users_listbox.insert(tk.END, f"● {user} (you)")
             else:
                 self.users_listbox.insert(tk.END, f"● {user}")
         
-        # Update recipient dropdown (exclude yourself)
         other_users = [user for user in users if user != self.username]
         self.recipient_combo['values'] = other_users
         if other_users and not self.recipient_var.get():
@@ -750,7 +958,14 @@ class ChatClientGUI:
 # MAIN APPLICATION
 # ============================================
 
-def main():
+def run_server_only():
+    """Run just the server (for dedicated server mode)"""
+    print("Starting dedicated chat server...")
+    server = ChatServer()
+    server.start()
+
+def run_client_only():
+    """Run just the client"""
     root = tk.Tk()
     app = ChatClientGUI(root)
     
@@ -769,5 +984,8 @@ def main():
     root.mainloop()
 
 if __name__ == "__main__":
-    main()
-    
+    # Check command line arguments
+    if len(sys.argv) > 1 and sys.argv[1] == '--server':
+        run_server_only()
+    else:
+        run_client_only()
