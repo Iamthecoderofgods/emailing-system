@@ -7,6 +7,7 @@ import datetime
 import sqlite3
 from hashlib import sha256
 import queue
+import time
 
 # ============================================
 # SERVER COMPONENT
@@ -19,6 +20,7 @@ class ChatServer:
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.clients = {}
         self.lock = threading.Lock()
+        self.start_time = time.time()
         self.setup_database()
         
     def setup_database(self):
@@ -36,7 +38,6 @@ class ChatServer:
                               timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         self.conn.commit()
         
-        # Add some test users
         test_users = [('admin', 'admin123'), ('user1', 'password1'), ('user2', 'password2')]
         for username, password in test_users:
             try:
@@ -46,6 +47,25 @@ class ChatServer:
             except:
                 pass
         self.conn.commit()
+    
+    def get_uptime(self):
+        """Get server uptime in human readable format"""
+        uptime_seconds = int(time.time() - self.start_time)
+        days = uptime_seconds // (24 * 3600)
+        uptime_seconds %= (24 * 3600)
+        hours = uptime_seconds // 3600
+        uptime_seconds %= 3600
+        minutes = uptime_seconds // 60
+        seconds = uptime_seconds % 60
+        
+        if days > 0:
+            return f"{days}d {hours}h {minutes}m {seconds}s"
+        elif hours > 0:
+            return f"{hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            return f"{minutes}m {seconds}s"
+        else:
+            return f"{seconds}s"
     
     def hash_password(self, password):
         return sha256(password.encode()).hexdigest()
@@ -75,6 +95,21 @@ class ChatServer:
         self.cursor.execute('''SELECT sender, message, timestamp FROM messages 
                              ORDER BY timestamp DESC LIMIT ?''', (count,))
         return self.cursor.fetchall()
+    
+    def broadcast_user_list(self, exclude_socket=None):
+        """Send updated user list to all connected clients"""
+        with self.lock:
+            users = list(self.clients.values())
+            user_list_message = {
+                'type': 'users_list',
+                'users': users
+            }
+            for client_socket in list(self.clients.keys()):
+                if client_socket != exclude_socket:
+                    try:
+                        client_socket.send(json.dumps(user_list_message).encode('utf-8'))
+                    except:
+                        self.remove_client(client_socket)
     
     def broadcast(self, message, exclude_socket=None):
         """Send message to all connected clients except the sender"""
@@ -117,17 +152,21 @@ class ChatServer:
                             'type': 'login',
                             'success': True,
                             'username': username,
-                            'history': history
+                            'history': history,
+                            'users': list(self.clients.values())  # Send current users to new user
                         }
                         client_socket.send(json.dumps(response).encode('utf-8'))
                         
-                        # Notify other users
+                        # Notify ALL other users about new user AND send updated user list
                         notification = {
                             'type': 'notification',
-                            'message': f'{username} has joined the chat!',
-                            'users': list(self.clients.values())
+                            'message': f'{username} has joined the chat!'
                         }
                         self.broadcast(json.dumps(notification), exclude_socket=client_socket)
+                        
+                        # Broadcast updated user list to ALL users (including the new one)
+                        self.broadcast_user_list()
+                        
                     else:
                         response = {
                             'type': 'login',
@@ -137,10 +176,7 @@ class ChatServer:
                         client_socket.send(json.dumps(response).encode('utf-8'))
                         
                 elif data['type'] == 'message' and username:
-                    # Save message
                     self.save_message(username, data['message'])
-                    
-                    # Broadcast message
                     message_data = {
                         'type': 'message',
                         'sender': username,
@@ -159,14 +195,12 @@ class ChatServer:
                         'timestamp': datetime.datetime.now().strftime('%H:%M:%S')
                     }
                     
-                    # Find receiver's socket
                     with self.lock:
                         for sock, user in self.clients.items():
                             if user == receiver:
                                 sock.send(json.dumps(message_data).encode('utf-8'))
                                 break
                     
-                    # Send to sender too
                     client_socket.send(json.dumps(message_data).encode('utf-8'))
                     
                 elif data['type'] == 'get_users' and username:
@@ -175,6 +209,17 @@ class ChatServer:
                     response = {
                         'type': 'users_list',
                         'users': users
+                    }
+                    client_socket.send(json.dumps(response).encode('utf-8'))
+                
+                elif data['type'] == 'uptime':
+                    with self.lock:
+                        online_count = len(self.clients)
+                    response = {
+                        'type': 'uptime',
+                        'uptime': self.get_uptime(),
+                        'start_time': datetime.datetime.fromtimestamp(self.start_time).strftime('%Y-%m-%d %H:%M:%S'),
+                        'online_users': online_count
                     }
                     client_socket.send(json.dumps(response).encode('utf-8'))
                         
@@ -187,12 +232,14 @@ class ChatServer:
                         del self.clients[client_socket]
                     notification = {
                         'type': 'notification',
-                        'message': f'{username} has left the chat!',
-                        'users': list(self.clients.values())
+                        'message': f'{username} has left the chat!'
                     }
                     self.broadcast(json.dumps(notification))
+                    
+                    # Update user list for remaining users
+                    self.broadcast_user_list()
+                    
             client_socket.close()
-            print(f"Client {address} disconnected")
     
     def remove_client(self, client_socket):
         with self.lock:
@@ -206,6 +253,7 @@ class ChatServer:
             self.server.bind((self.host, self.port))
             self.server.listen()
             print(f"Chat server started on {self.host}:{self.port}")
+            print(f"Server start time: {datetime.datetime.fromtimestamp(self.start_time).strftime('%Y-%m-%d %H:%M:%S')}")
             
             try:
                 while True:
@@ -234,17 +282,14 @@ class ChatClientGUI:
         self.root.geometry("900x700")
         self.root.configure(bg='#2C3E50')
         
-        # Initialize server
         self.server = ChatServer()
         self.server.start_server_in_thread()
         
-        # Client socket
         self.client_socket = None
         self.connected = False
         self.username = None
         self.message_queue = queue.Queue()
         
-        # UI Colors
         self.colors = {
             'bg': '#2C3E50',
             'fg': '#ECF0F1',
@@ -256,21 +301,17 @@ class ChatClientGUI:
             'message_fg': '#2C3E50'
         }
         
-        # Setup UI
         self.setup_ui()
         self.start_message_handler()
         
     def setup_ui(self):
-        # Custom fonts
         self.title_font = font.Font(family="Helvetica", size=24, weight="bold")
         self.text_font = font.Font(family="Arial", size=11)
         self.message_font = font.Font(family="Arial", size=10)
         
-        # Main container
         self.main_frame = tk.Frame(self.root, bg=self.colors['bg'])
         self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Create notebook for tabs
         style = ttk.Style()
         style.theme_use('clam')
         style.configure('TNotebook', background=self.colors['bg'], borderwidth=0)
@@ -281,20 +322,15 @@ class ChatClientGUI:
         self.notebook = ttk.Notebook(self.main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
         
-        # Login Tab
         self.login_tab = tk.Frame(self.notebook, bg=self.colors['bg'])
         self.notebook.add(self.login_tab, text='Login / Register')
         self.setup_login_tab()
         
-        # Chat Tab
         self.chat_tab = tk.Frame(self.notebook, bg=self.colors['bg'])
         self.notebook.add(self.chat_tab, text='Chat Room')
         self.setup_chat_tab()
         
-        # Initially show login tab
         self.notebook.hide(1)
-        
-        # Connect to server
         self.connect_to_server()
     
     def connect_to_server(self):
@@ -303,13 +339,10 @@ class ChatClientGUI:
             self.client_socket.connect((self.server.host, self.server.port))
             self.connected = True
             threading.Thread(target=self.receive_messages, daemon=True).start()
-            print("Connected to server")
         except Exception as e:
-            print(f"Failed to connect: {e}")
             messagebox.showerror("Connection Error", "Failed to connect to server")
     
     def setup_login_tab(self):
-        # Title
         title_frame = tk.Frame(self.login_tab, bg=self.colors['bg'])
         title_frame.pack(pady=(30, 20))
         
@@ -325,21 +358,18 @@ class ChatClientGUI:
                                  fg=self.colors['fg'])
         subtitle_label.pack(pady=5)
         
-        # Login Frame
         login_frame = tk.Frame(self.login_tab, bg=self.colors['secondary'], 
                               relief=tk.RAISED, bd=2)
         login_frame.pack(padx=80, pady=20, fill=tk.X)
         
-        # Username
         tk.Label(login_frame, text="Username:", bg=self.colors['secondary'], 
                 fg=self.colors['fg'], font=self.text_font).grid(row=0, column=0, 
                                                               padx=20, pady=15, sticky='w')
         self.username_entry = tk.Entry(login_frame, font=self.text_font, 
                                       width=30, bg='white', fg='black')
         self.username_entry.grid(row=0, column=1, padx=20, pady=15, sticky='ew')
-        self.username_entry.insert(0, "user1")  # Default for testing
+        self.username_entry.insert(0, "user1")
         
-        # Password
         tk.Label(login_frame, text="Password:", bg=self.colors['secondary'], 
                 fg=self.colors['fg'], font=self.text_font).grid(row=1, column=0, 
                                                               padx=20, pady=15, sticky='w')
@@ -347,13 +377,11 @@ class ChatClientGUI:
                                       width=30, bg='white', fg='black', 
                                       show="•")
         self.password_entry.grid(row=1, column=1, padx=20, pady=15, sticky='ew')
-        self.password_entry.insert(0, "password1")  # Default for testing
+        self.password_entry.insert(0, "password1")
         
-        # Buttons Frame
         button_frame = tk.Frame(login_frame, bg=self.colors['secondary'])
         button_frame.grid(row=2, column=0, columnspan=2, pady=20)
         
-        # Login Button
         self.login_btn = tk.Button(button_frame, text="Login", 
                                   command=self.login, 
                                   bg=self.colors['accent'], 
@@ -364,7 +392,6 @@ class ChatClientGUI:
                                   bd=2)
         self.login_btn.pack(side=tk.LEFT, padx=10)
         
-        # Register Button
         self.register_btn = tk.Button(button_frame, text="Register", 
                                      command=self.register, 
                                      bg=self.colors['success'], 
@@ -375,14 +402,12 @@ class ChatClientGUI:
                                      bd=2)
         self.register_btn.pack(side=tk.LEFT, padx=10)
         
-        # Status Label
         self.login_status = tk.Label(self.login_tab, text="", 
                                     bg=self.colors['bg'], 
                                     fg=self.colors['warning'],
                                     font=self.text_font)
         self.login_status.pack(pady=10)
         
-        # Test Credentials
         test_frame = tk.Frame(self.login_tab, bg=self.colors['bg'])
         test_frame.pack(pady=20)
         
@@ -398,18 +423,23 @@ class ChatClientGUI:
         test_text.pack()
     
     def setup_chat_tab(self):
-        # Top frame for user info and controls
         top_frame = tk.Frame(self.chat_tab, bg=self.colors['secondary'])
         top_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # User info
         self.user_label = tk.Label(top_frame, text="Not logged in", 
                                   bg=self.colors['secondary'], 
                                   fg=self.colors['fg'],
                                   font=self.text_font)
         self.user_label.pack(side=tk.LEFT, padx=10, pady=10)
         
-        # Online users button
+        self.uptime_btn = tk.Button(top_frame, text="🖥️ Server Info", 
+                                   command=self.get_server_uptime,
+                                   bg=self.colors['accent'], 
+                                   fg='white',
+                                   font=self.text_font,
+                                   relief=tk.RAISED)
+        self.uptime_btn.pack(side=tk.RIGHT, padx=10, pady=5)
+        
         self.users_btn = tk.Button(top_frame, text="🔄 Refresh Users", 
                                   command=self.get_online_users,
                                   bg=self.colors['accent'], 
@@ -418,7 +448,6 @@ class ChatClientGUI:
                                   relief=tk.RAISED)
         self.users_btn.pack(side=tk.RIGHT, padx=10, pady=5)
         
-        # Logout button
         self.logout_btn = tk.Button(top_frame, text="Logout", 
                                    command=self.logout,
                                    bg=self.colors['warning'], 
@@ -427,11 +456,9 @@ class ChatClientGUI:
                                    relief=tk.RAISED)
         self.logout_btn.pack(side=tk.RIGHT, padx=10, pady=5)
         
-        # Chat display area
         chat_frame = tk.Frame(self.chat_tab, bg=self.colors['bg'])
         chat_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Message display
         self.message_display = scrolledtext.ScrolledText(
             chat_frame, 
             wrap=tk.WORD,
@@ -443,11 +470,9 @@ class ChatClientGUI:
         )
         self.message_display.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
-        # Bottom frame for message input
         bottom_frame = tk.Frame(self.chat_tab, bg=self.colors['secondary'])
         bottom_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # Message type selection
         type_frame = tk.Frame(bottom_frame, bg=self.colors['secondary'])
         type_frame.pack(fill=tk.X, padx=10, pady=5)
         
@@ -463,7 +488,6 @@ class ChatClientGUI:
                       value="private", bg=self.colors['secondary'], 
                       fg=self.colors['fg']).pack(side=tk.LEFT, padx=10)
         
-        # Private message recipient
         self.recipient_var = tk.StringVar()
         self.recipient_combo = ttk.Combobox(type_frame, 
                                           textvariable=self.recipient_var,
@@ -471,7 +495,6 @@ class ChatClientGUI:
                                           width=15)
         self.recipient_combo.pack(side=tk.LEFT, padx=5)
         
-        # Message input
         input_frame = tk.Frame(bottom_frame, bg=self.colors['secondary'])
         input_frame.pack(fill=tk.X, padx=10, pady=5)
         
@@ -480,7 +503,6 @@ class ChatClientGUI:
                                     font=self.message_font)
         self.message_input.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         
-        # Send button
         self.send_btn = tk.Button(input_frame, text="Send", 
                                  command=self.send_message,
                                  bg=self.colors['success'], 
@@ -491,7 +513,6 @@ class ChatClientGUI:
                                  relief=tk.RAISED)
         self.send_btn.pack(side=tk.RIGHT)
         
-        # Online users list
         users_frame = tk.Frame(self.chat_tab, bg=self.colors['secondary'])
         users_frame.pack(fill=tk.X, padx=5, pady=5)
         
@@ -505,7 +526,6 @@ class ChatClientGUI:
                                        height=4)
         self.users_listbox.pack(fill=tk.X, padx=10, pady=(0, 10))
         
-        # Bind Enter key to send message
         self.message_input.bind("<Return>", lambda e: self.send_message())
         self.message_input.bind("<Shift-Return>", 
                                lambda e: self.message_input.insert(tk.INSERT, '\n'))
@@ -536,10 +556,6 @@ class ChatClientGUI:
         
         if not username or not password:
             self.login_status.config(text="Please enter username and password!")
-            return
-            
-        if len(password) < 4:
-            self.login_status.config(text="Password must be at least 4 characters!")
             return
             
         register_data = {
@@ -587,7 +603,6 @@ class ChatClientGUI:
                 'message': message
             }
             
-            # Display in chat
             self.display_message(f"You → {recipient}: {message}", "you")
         else:
             message_data = {
@@ -595,7 +610,6 @@ class ChatClientGUI:
                 'message': message
             }
             
-            # Display in chat
             self.display_message(f"You: {message}", "you")
         
         try:
@@ -603,8 +617,15 @@ class ChatClientGUI:
         except:
             messagebox.showerror("Error", "Failed to send message!")
         
-        # Clear input
         self.message_input.delete(1.0, tk.END)
+    
+    def get_server_uptime(self):
+        if self.username:
+            request = {'type': 'uptime'}
+            try:
+                self.client_socket.send(json.dumps(request).encode('utf-8'))
+            except:
+                messagebox.showerror("Error", "Failed to contact server")
     
     def get_online_users(self):
         if self.username:
@@ -645,11 +666,9 @@ class ChatClientGUI:
                     self.user_label.config(text=f"Logged in as: {self.username}")
                     self.login_status.config(text="Login successful!", fg=self.colors['success'])
                     
-                    # Switch to chat tab
                     self.notebook.select(1)
                     self.notebook.hide(0)
                     
-                    # Display history
                     self.message_display.config(state='normal')
                     self.message_display.insert(tk.END, f"=== Welcome {self.username} ===\n\n")
                     if 'history' in data:
@@ -658,8 +677,10 @@ class ChatClientGUI:
                     self.message_display.config(state='disabled')
                     self.message_display.see(tk.END)
                     
-                    # Get online users
-                    self.get_online_users()
+                    # Update user list from login response
+                    if 'users' in data:
+                        self.update_users_list(data['users'])
+                    
                 else:
                     self.login_status.config(text=data['message'], fg=self.colors['warning'])
                     
@@ -679,11 +700,18 @@ class ChatClientGUI:
                 
             elif data['type'] == 'notification':
                 self.display_message(f"⚡ {data['message']}", "notification")
-                if 'users' in data:
-                    self.update_users_list(data['users'])
                     
             elif data['type'] == 'users_list':
                 self.update_users_list(data['users'])
+                
+            elif data['type'] == 'uptime':
+                messagebox.showinfo(
+                    "Server Information",
+                    f"🚀 Server Started: {data['start_time']}\n"
+                    f"⏱️  Uptime: {data['uptime']}\n"
+                    f"👥 Online Users: {data['online_users']}\n"
+                    f"🌐 Server: {self.server.host}:{self.server.port}"
+                )
                 
         except Exception as e:
             print(f"Error handling message: {e}")
@@ -691,7 +719,6 @@ class ChatClientGUI:
     def display_message(self, message, msg_type):
         self.message_display.config(state='normal')
         
-        # Configure tags for different message types
         if not self.message_display.tag_names():
             self.message_display.tag_config("you", foreground="#2980B9", font=("Arial", 10, "bold"))
             self.message_display.tag_config("other", foreground="#2C3E50")
@@ -699,25 +726,25 @@ class ChatClientGUI:
             self.message_display.tag_config("notification", foreground="#E67E22", font=("Arial", 9))
             self.message_display.tag_config("history", foreground="#7F8C8D", font=("Arial", 9))
         
-        # Insert message with appropriate tag
         self.message_display.insert(tk.END, f"{message}\n", msg_type)
         self.message_display.config(state='disabled')
         self.message_display.see(tk.END)
     
     def update_users_list(self, users):
         self.users_listbox.delete(0, tk.END)
-        online_users = [user for user in users if user != self.username]
         
-        if online_users:
-            for user in online_users:
+        # Show all users, highlight yourself
+        for user in users:
+            if user == self.username:
+                self.users_listbox.insert(tk.END, f"● {user} (you)")
+            else:
                 self.users_listbox.insert(tk.END, f"● {user}")
-        else:
-            self.users_listbox.insert(tk.END, "No other users online")
         
-        # Update recipient dropdown
-        self.recipient_combo['values'] = online_users
-        if online_users and not self.recipient_var.get():
-            self.recipient_var.set(online_users[0])
+        # Update recipient dropdown (exclude yourself)
+        other_users = [user for user in users if user != self.username]
+        self.recipient_combo['values'] = other_users
+        if other_users and not self.recipient_var.get():
+            self.recipient_var.set(other_users[0])
 
 # ============================================
 # MAIN APPLICATION
@@ -727,7 +754,6 @@ def main():
     root = tk.Tk()
     app = ChatClientGUI(root)
     
-    # Center window
     root.update_idletasks()
     width = root.winfo_width()
     height = root.winfo_height()
@@ -735,7 +761,6 @@ def main():
     y = (root.winfo_screenheight() // 2) - (height // 2)
     root.geometry(f'{width}x{height}+{x}+{y}')
     
-    # Handle window close
     def on_closing():
         if messagebox.askokcancel("Quit", "Do you want to quit?"):
             root.destroy()
